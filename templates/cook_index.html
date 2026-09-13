@@ -1,0 +1,25 @@
+<html>
+    <body>
+        {% if result %}
+          <IMG SRC="{{filepath}}" width="200" BORDER="1">画像の食材は{{result}}。
+          <br>
+          <ul id="cook_list">
+            {% for i in range(5) %}
+            <li>
+                {{recipe_title[i]}}
+                <a href="{{recipe_url[i]}}" target="_blank">レシピ{{i+1}}</a>
+            </li>
+            {% endfor %}
+          </ul>
+          <br>
+          <hr>
+        {% endif %}
+          食材の画像を送信してください。
+          <br>
+          <form action = "./" method = "POST" enctype = "multipart/form-data">
+            <input type = "file" name = "file" />
+            <br>
+            <input type = "submit"/>
+          </form>
+    </body>
+</html>
