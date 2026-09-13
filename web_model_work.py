@@ -20,59 +20,107 @@ Original file is located at
 import requests
 import PIL
 from datetime import datetime
-import transformers
-import torch
 import os
+import base64
+from io import BytesIO
+from urllib.parse import quote
+from bs4 import BeautifulSoup
+from PIL import Image
 
 from flask import Flask, render_template, request, redirect, url_for, abort
-from playwright.sync_api import sync_playwright
-from urllib.parse import quote
 
 #device= "cuda" if torch.cuda.is_available() else "cpu"
-model=transformers.LlavaForConditionalGeneration.from_pretrained("llava-hf/llava-1.5-7b-hf",device_map="auto",torch_dtype=torch.float16,low_cpu_mem_usage=True)
-processor=transformers.LlavaProcessor.from_pretrained("llava-hf/llava-1.5-7b-hf",device_map="auto",torch_dtype=torch.float16,low_cpu_mem_usage=True)
-prompt="USER:<image>\nこの画像の食材は何？ひらがなかカタカナで、1単語で教えて。\nASSISTANT:"
 
 app = Flask(__name__)
 
+HF_TOKEN = os.environ.get("HF_TOKEN")
+MODEL_ID = "llava-hf/llava-1.5-7b-hf"
+# Hugging FaceのChat Completions互換エンドポイント
+API_URL = "https://api-inference.huggingface.co/v1/chat/completions"
+
+def analyze_image_with_llava(pil_image: Image.Image) -> str:
+    # 1. PIL画像をBase64形式の文字列に変換
+    buffered = BytesIO()
+    pil_image.save(buffered, format="JPEG")
+    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    image_data_url = f"data:image/jpeg;base64,{img_str}"
+
+    # 2. ヘッダーとプロンプト（メッセージ構造）の構築
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": MODEL_ID,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                    {"type": "text", "text": "この画像の食材は何？ひらがなかカタカナで、1単語で教えて。"}
+                ]
+            }
+        ],
+        "max_tokens": 30
+    }
+
+    # 3. Hugging Faceへ送信
+    response = requests.post(API_URL, headers=headers, json=payload)
+    response_data = response.json()
+    
+    if response.status_code != 200:
+        raise Exception(f"API Error: {response_data}")
+
+    # レスポンスから解析結果のテキストを抽出
+    return response_data["choices"][0]["message"]["content"].strip()
+
 def search_get_recipe(keyword):
-  with sync_playwright() as p:
-    browser=p.chromium.launch(headless=True)
-    page=browser.new_page()
+    """Playwrightの代わりにrequests + BeautifulSoupを使って高速・軽量にスクレイピング"""
     encoded_keyword = quote(keyword)
     search_url = f"https://cookpad.com/jp/search/{encoded_keyword}"
-    page.goto(search_url)
-    page.wait_for_load_state("networkidle")
-    recipe_links = page.locator('a[href*="/jp/recipes/"]').all()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
 
-    url_list=[]
-    title_list=[]
+    url_list = []
+    title_list = []
+    full_url_list=[]
+    
 
-    for link in recipe_links:
-      href = link.get_attribute("href")
-      if href not in url_list: # 重複を除外
-          url_list.append(href)
-      if len(url_list) >= 6:
-        url_list=url_list[1:6]
-        break
+    try:
+        # 検索結果ページの取得
+        res = requests.get(search_url, headers=headers, timeout=5)
+        soup = BeautifulSoup(res.text, "html.parser")
 
-    full_url_list = []
-    for href in url_list:
-      # 相対パスの場合はドメインを追加
-      full_url = "https://cookpad.com" + href if href.startswith("/") else href
-      full_url_list.append(full_url)
-      page.goto(full_url)
-      try:
-          # h1 が表示されるのを最大 5秒間 待つ
-          page.wait_for_selector("h1", timeout=5000)
-          title = page.locator("h1").first.inner_text()
-      except Exception:
-          # h1 が取得できなかった場合は、ブラウザタブのタイトルからレシピ名を取得
-          title = page.title().split(" | ")[0]
-      title_list.append(title)
+        recipe_links = soup.select('a[href*="/jp/recipes/"]')
 
-    browser.close()
-    return full_url_list , title_list
+        for link in recipe_links:
+            href = link.get("href")
+            if href and href not in url_list:
+                url_list.append(href)
+            if len(url_list) >= 5:
+                break
+
+        for href in url_list:
+            full_url = (
+                "https://cookpad.com" + href if href.startswith("/") else href
+            )
+
+            # 各レシピページのタイトル取得
+            r = requests.get(full_url, headers=headers, timeout=5)
+            s = BeautifulSoup(r.text, "html.parser")
+
+            h1 = s.find("h1")
+            title = h1.get_text(strip=True) if h1 else "クックパッド レシピ"
+
+            full_url_list.append(full_url)
+            title_list.append(title)
+
+    except Exception as e:
+        print(f"Scraping error: {e}")
+
+    return full_url_list, title_list
 
 
 @app.route("/",methods=["GET","POST"])
@@ -87,21 +135,7 @@ def upload_file():
     f.save(filepath)
     image=PIL.Image.open(filepath).convert("RGB")
 
-    # kwargsで明示的に渡し、モデルのdtypeに合わせる
-    inputs=processor(text=prompt, images=image, return_tensors="pt").to(model.device, torch.float16)
-
-    outputs=model.generate(
-        **inputs,
-        do_sample=False,
-        max_new_tokens=30,
-        use_cache=True,
-        eos_token_id=processor.tokenizer.eos_token_id,
-        pad_token_id=processor.tokenizer.eos_token_id,
-    )
-
-    # ASSISTANT以降の出力テキストを抽出
-    decoded_output=processor.decode(outputs[0], skip_special_tokens=True)
-    output = decoded_output.split("ASSISTANT:")[-1].strip()
+    output = analyze_image_with_llava(image)
 
     recipe_url , recipe_title = search_get_recipe(output)
 
